@@ -90,13 +90,52 @@ A production-ready real-time user action tracking system built with **Kafka**, *
 
 ## 📋 Prerequisites
 
-- Python 3.11+
-- Node.js 18+
-- PostgreSQL (optional, SQLite used by default)
-- Redis
-- Apache Kafka (optional, mock mode available)
+- Docker and Docker Compose (auto-installed)
+- Python 3.9+ (auto-installed)
+- Node.js 16+ (auto-installed)
+- Git (to clone the repository)
 
-## 🛠️ Installation
+## 🚀 Quick Start (One Command!)
+
+```bash
+# Clone and run everything
+git clone https://github.com/your-username/kafka-realtime-dashboard.git
+cd kafka-realtime-dashboard
+./install.sh && ./start.sh
+```
+
+**That's it!** 🎉 Your dashboard will be available at http://localhost:3000
+
+For detailed setup instructions, see [QUICK_START.md](QUICK_START.md)
+
+## 🛠️ Management Scripts
+
+The project includes comprehensive DevOps scripts for easy management:
+
+```bash
+# Install all dependencies and setup
+./install.sh
+
+# Start all services
+./start.sh
+
+# Start with batch producer (for load testing)
+./start.sh --with-batch-producer
+
+# Stop all services
+./stop.sh
+
+# Stop and clean up containers
+./stop.sh --cleanup
+
+# Check service status and health
+./status.sh
+
+# Restart all services
+./restart.sh
+```
+
+## 🛠️ Manual Installation
 
 ### Option 1: Docker (Recommended)
 
