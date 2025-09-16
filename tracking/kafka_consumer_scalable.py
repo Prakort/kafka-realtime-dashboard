@@ -1,6 +1,11 @@
 """
-Scalable Kafka Consumer Implementation
-Supports multiple consumer instances with load balancing and partition assignment
+Production-ready Scalable Kafka Consumer Implementation
+Supports multiple consumer instances with best practices:
+- Manual offset commits for at-least-once delivery
+- Retry logic with exponential backoff
+- Dead letter queue support
+- Graceful shutdown and error handling
+- Structured logging and monitoring
 """
 
 import json
@@ -8,7 +13,17 @@ import logging
 import time
 import uuid
 import threading
+import random
+import os
+import math
 from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+import django
+
+# Setup Django
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'dashboard_backend.settings')
+django.setup()
+
 from django.conf import settings
 from django.utils import timezone as django_timezone
 from channels.layers import get_channel_layer
@@ -20,23 +35,55 @@ logger = logging.getLogger(__name__)
 
 
 class ScalableKafkaConsumer:
-    """Scalable Kafka consumer with load balancing support"""
+    """
+    Production-ready scalable Kafka consumer with best practices:
+    - Manual offset commits for at-least-once delivery
+    - Retry logic with exponential backoff
+    - Dead letter queue support
+    - Graceful shutdown and error handling
+    - Comprehensive monitoring and metrics
+    """
     
     def __init__(self, consumer_id=None, consumer_group='dashboard_consumer_group', 
-                 max_consumers=3, partitions=3):
+                 max_consumers=3, partitions=3, dlq_topic=None):
         self.consumer_id = consumer_id or f'consumer_{uuid.uuid4().hex[:8]}'
         self.consumer_group = consumer_group
         self.max_consumers = max_consumers
         self.partitions = partitions
+        self.dlq_topic = dlq_topic or f"{settings.KAFKA_TOPIC_USER_EVENTS}_dlq"
         self.bootstrap_servers = settings.KAFKA_BOOTSTRAP_SERVERS
         self.topic = settings.KAFKA_TOPIC_USER_EVENTS
         self.channel_layer = get_channel_layer()
         self.consumer = None
+        self.dlq_producer = None
         self.running = False
-        self.processed_count = 0
-        self.error_count = 0
         
-        logger.info(f"Initialized scalable consumer: {self.consumer_id}")
+        # Enhanced metrics for monitoring
+        self._metrics = {
+            'messages_processed': 0,
+            'messages_failed': 0,
+            'messages_retried': 0,
+            'messages_sent_to_dlq': 0,
+            'offset_commits': 0,
+            'start_time': time.time(),
+            'last_commit_time': None,
+            'processing_errors': []
+        }
+        
+        # Retry configuration
+        self.max_retries = 3
+        self.base_retry_delay = 1.0  # seconds
+        self.max_retry_delay = 60.0  # seconds
+        
+        logger.info(
+            "Initialized scalable consumer",
+            extra={
+                'consumer_id': self.consumer_id,
+                'consumer_group': self.consumer_group,
+                'topic': self.topic,
+                'dlq_topic': self.dlq_topic
+            }
+        )
     
     def _is_kafka_available(self):
         """Check if Kafka is available"""
@@ -61,25 +108,47 @@ class ScalableKafkaConsumer:
             return
         
         try:
-            from confluent_kafka import Consumer, KafkaError
+            from confluent_kafka import Consumer, KafkaError, Producer
             
-            # Configure consumer for scalability
+            # Production-ready consumer configuration
             config = {
                 'bootstrap.servers': self.bootstrap_servers,
                 'group.id': self.consumer_group,
                 'client.id': self.consumer_id,
+                
+                # Offset management - manual commits for at-least-once delivery
                 'auto.offset.reset': 'latest',
-                'enable.auto.commit': True,
-                'auto.commit.interval.ms': 1000,
+                'enable.auto.commit': False,  # Manual commits only
+                
+                # Session and heartbeat management
                 'session.timeout.ms': 30000,
                 'heartbeat.interval.ms': 10000,
                 'max.poll.interval.ms': 300000,
-                'fetch.wait.max.ms': 500,
+                
+                # Fetch configuration for performance
                 'fetch.min.bytes': 1,
                 'fetch.max.bytes': 52428800,  # 50MB
+                
+                # Network and reliability
                 'socket.timeout.ms': 10000,
                 'metadata.max.age.ms': 300000,
+                'reconnect.backoff.ms': 100,
+                'reconnect.backoff.max.ms': 10000,
+                
+                # Isolation and consistency
+                'isolation.level': 'read_committed',
             }
+            
+            # Initialize DLQ producer for failed messages
+            dlq_config = {
+                'bootstrap.servers': self.bootstrap_servers,
+                'client.id': f'{self.consumer_id}_dlq_producer',
+                'acks': 'all',
+                'enable.idempotence': True,
+                'retries': 3,
+                'max.in.flight.requests.per.connection': 1,
+            }
+            self.dlq_producer = Producer(dlq_config)
             
             self.consumer = Consumer(config)
             
@@ -115,43 +184,104 @@ class ScalableKafkaConsumer:
             self._mock_consumer()
     
     def _consume_loop(self):
-        """Main consumption loop"""
-        logger.info(f"Consumer {self.consumer_id} starting consumption loop...")
+        """Enhanced consumption loop with proper error handling and manual commits"""
+        logger.info(
+            "Starting consumption loop",
+            extra={'consumer_id': self.consumer_id, 'topic': self.topic}
+        )
+        
+        messages_to_commit = []
         
         while self.running:
             try:
                 msg = self.consumer.poll(timeout=1.0)
                 
                 if msg is None:
+                    # Commit offsets for processed messages
+                    if messages_to_commit:
+                        self._commit_offsets(messages_to_commit)
+                        messages_to_commit.clear()
                     continue
                 
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
-                        logger.debug(f"Consumer {self.consumer_id} reached end of partition {msg.partition()}")
+                        logger.debug(
+                            "Reached end of partition",
+                            extra={
+                                'consumer_id': self.consumer_id,
+                                'partition': msg.partition()
+                            }
+                        )
                     else:
-                        logger.error(f"Consumer {self.consumer_id} error: {msg.error()}")
-                        self.error_count += 1
+                        self._metrics['messages_failed'] += 1
+                        logger.error(
+                            "Consumer error",
+                            extra={
+                                'consumer_id': self.consumer_id,
+                                'error': str(msg.error()),
+                                'error_code': msg.error().code()
+                            }
+                        )
                     continue
                 
-                # Process message
+                # Process message with retry logic
                 try:
                     event_data = json.loads(msg.value().decode('utf-8'))
-                    self.process_event(event_data, msg.partition())
+                    success = self._process_with_retry(event_data, msg)
                     
+                    if success:
+                        messages_to_commit.append(msg)
+                        self._metrics['messages_processed'] += 1
+                    else:
+                        # Send to DLQ after max retries
+                        self._send_to_dlq(event_data, msg, "Max retries exceeded")
+                        
                 except json.JSONDecodeError as e:
-                    logger.error(f"Consumer {self.consumer_id} JSON decode error: {e}")
-                    self.error_count += 1
+                    self._metrics['messages_failed'] += 1
+                    logger.error(
+                        "JSON decode error",
+                        extra={
+                            'consumer_id': self.consumer_id,
+                            'error': str(e),
+                            'partition': msg.partition(),
+                            'offset': msg.offset()
+                        }
+                    )
+                    # Send malformed messages to DLQ
+                    self._send_to_dlq(None, msg, f"JSON decode error: {e}")
+                    
                 except Exception as e:
-                    logger.error(f"Consumer {self.consumer_id} processing error: {e}")
-                    self.error_count += 1
+                    self._metrics['messages_failed'] += 1
+                    logger.error(
+                        "Processing error",
+                        extra={
+                            'consumer_id': self.consumer_id,
+                            'error': str(e),
+                            'partition': msg.partition(),
+                            'offset': msg.offset()
+                        }
+                    )
                     
             except KeyboardInterrupt:
-                logger.info(f"Consumer {self.consumer_id} interrupted by user")
+                logger.info(
+                    "Consumer interrupted by user",
+                    extra={'consumer_id': self.consumer_id}
+                )
                 break
             except Exception as e:
-                logger.error(f"Consumer {self.consumer_id} loop error: {e}")
-                self.error_count += 1
+                self._metrics['messages_failed'] += 1
+                logger.error(
+                    "Consumption loop error",
+                    extra={
+                        'consumer_id': self.consumer_id,
+                        'error': str(e)
+                    }
+                )
                 time.sleep(1)
+        
+        # Final commit before shutdown
+        if messages_to_commit:
+            self._commit_offsets(messages_to_commit)
         
         self._cleanup()
     
@@ -168,8 +298,8 @@ class ScalableKafkaConsumer:
                     logger.info(f"Consumer {self.consumer_id} received mock event: {event_data['event_type']}")
                     self.process_event(event_data, partition=0)
                 else:
-                    # Generate some mock events for testing
-                    if hasattr(event_data, '__getitem__') and random.random() < 0.1:  # 10% chance
+                    # Generate some mock events for testing (10% chance)
+                    if random.random() < 0.1:
                         mock_event = self._generate_mock_event()
                         self.process_event(mock_event, partition=0)
                     
@@ -196,8 +326,149 @@ class ScalableKafkaConsumer:
             'batch_id': f'mock_batch_{uuid.uuid4().hex[:8]}'
         }
     
-    def process_event(self, event_data, partition=None):
-        """Process a single event with consumer tracking"""
+    def _process_with_retry(self, event_data: Dict[str, Any], msg) -> bool:
+        """
+        Process event with exponential backoff retry logic
+        
+        Args:
+            event_data: Event data dictionary
+            msg: Kafka message object
+            
+        Returns:
+            bool: True if successful, False if max retries exceeded
+        """
+        for attempt in range(self.max_retries + 1):
+            try:
+                if attempt > 0:
+                    # Exponential backoff with jitter
+                    delay = min(
+                        self.base_retry_delay * (2 ** (attempt - 1)),
+                        self.max_retry_delay
+                    )
+                    jitter = random.uniform(0.1, 0.5) * delay
+                    time.sleep(delay + jitter)
+                    
+                    self._metrics['messages_retried'] += 1
+                    logger.info(
+                        f"Retrying message processing (attempt {attempt + 1}/{self.max_retries + 1})",
+                        extra={
+                            'consumer_id': self.consumer_id,
+                            'partition': msg.partition(),
+                            'offset': msg.offset(),
+                            'delay': delay + jitter
+                        }
+                    )
+                
+                # Process the event
+                self.process_event(event_data, msg.partition())
+                return True
+                
+            except Exception as e:
+                error_msg = str(e)
+                self._metrics['processing_errors'].append({
+                    'timestamp': time.time(),
+                    'attempt': attempt + 1,
+                    'error': error_msg,
+                    'partition': msg.partition(),
+                    'offset': msg.offset()
+                })
+                
+                if attempt == self.max_retries:
+                    logger.error(
+                        "Max retries exceeded for message",
+                        extra={
+                            'consumer_id': self.consumer_id,
+                            'partition': msg.partition(),
+                            'offset': msg.offset(),
+                            'error': error_msg,
+                            'attempts': attempt + 1
+                        }
+                    )
+                    return False
+                else:
+                    logger.warning(
+                        f"Processing failed, will retry (attempt {attempt + 1})",
+                        extra={
+                            'consumer_id': self.consumer_id,
+                            'error': error_msg,
+                            'partition': msg.partition(),
+                            'offset': msg.offset()
+                        }
+                    )
+        
+        return False
+    
+    def _commit_offsets(self, messages):
+        """Manually commit offsets after successful processing"""
+        try:
+            # Commit offsets for processed messages
+            self.consumer.commit(asynchronous=False)
+            self._metrics['offset_commits'] += 1
+            self._metrics['last_commit_time'] = time.time()
+            
+            logger.debug(
+                "Offsets committed successfully",
+                extra={
+                    'consumer_id': self.consumer_id,
+                    'message_count': len(messages),
+                    'commit_count': self._metrics['offset_commits']
+                }
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to commit offsets",
+                extra={
+                    'consumer_id': self.consumer_id,
+                    'error': str(e),
+                    'message_count': len(messages)
+                }
+            )
+    
+    def _send_to_dlq(self, event_data: Optional[Dict], msg, reason: str):
+        """Send failed message to Dead Letter Queue"""
+        try:
+            if self.dlq_producer:
+                dlq_message = {
+                    'original_topic': self.topic,
+                    'original_partition': msg.partition(),
+                    'original_offset': msg.offset(),
+                    'consumer_id': self.consumer_id,
+                    'failure_reason': reason,
+                    'timestamp': time.time(),
+                    'original_data': event_data or {'raw_message': msg.value().decode('utf-8', errors='replace')}
+                }
+                
+                self.dlq_producer.produce(
+                    topic=self.dlq_topic,
+                    value=json.dumps(dlq_message),
+                    key=f"dlq_{msg.partition()}_{msg.offset()}"
+                )
+                self.dlq_producer.flush(timeout=5)
+                
+                self._metrics['messages_sent_to_dlq'] += 1
+                
+                logger.warning(
+                    "Message sent to DLQ",
+                    extra={
+                        'consumer_id': self.consumer_id,
+                        'dlq_topic': self.dlq_topic,
+                        'reason': reason,
+                        'partition': msg.partition(),
+                        'offset': msg.offset()
+                    }
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to send message to DLQ",
+                extra={
+                    'consumer_id': self.consumer_id,
+                    'error': str(e),
+                    'reason': reason
+                }
+            )
+    
+    def process_event(self, event_data: Dict[str, Any], partition=None):
+        """Process a single event with enhanced error handling and tracking"""
         try:
             # Create MessageQueue entry
             message_id = str(uuid.uuid4())
@@ -228,11 +499,7 @@ class ScalableKafkaConsumer:
             # Check if should fail
             should_fail = event_data.get('should_fail', False)
             if should_fail:
-                queue_message.mark_failed("Simulated processing failure")
-                self.send_queue_update(queue_message)
-                logger.info(f"Consumer {self.consumer_id} simulated failure for event: {event_data['event_type']}")
-                self.error_count += 1
-                return
+                raise Exception("Simulated processing failure")
             
             # Create UserEvent
             user_event = UserEvent.objects.create(
@@ -250,16 +517,35 @@ class ScalableKafkaConsumer:
             self.send_queue_update(queue_message)
             self.send_stats_update()
             
-            self.processed_count += 1
-            logger.info(f"Consumer {self.consumer_id} processed event: {user_event} (Total: {self.processed_count})")
+            logger.info(
+                "Event processed successfully",
+                extra={
+                    'consumer_id': self.consumer_id,
+                    'event_id': user_event.id,
+                    'event_type': event_data['event_type'],
+                    'user_id': event_data['user_id'],
+                    'partition': partition
+                }
+            )
             
         except Exception as e:
-            logger.error(f"Consumer {self.consumer_id} error processing event: {e}")
-            self.error_count += 1
+            error_msg = str(e)
+            logger.error(
+                "Error processing event",
+                extra={
+                    'consumer_id': self.consumer_id,
+                    'error': error_msg,
+                    'event_type': event_data.get('event_type'),
+                    'user_id': event_data.get('user_id'),
+                    'partition': partition
+                }
+            )
             
             if 'queue_message' in locals():
-                queue_message.mark_failed(str(e))
+                queue_message.mark_failed(error_msg)
                 self.send_queue_update(queue_message)
+            
+            raise  # Re-raise for retry logic
     
     def send_to_websocket(self, user_event):
         """Send event update to WebSocket clients"""
@@ -337,8 +623,8 @@ class ScalableKafkaConsumer:
                 'top_clicked_elements': top_elements,
                 'consumer_stats': {
                     'consumer_id': self.consumer_id,
-                    'processed_count': self.processed_count,
-                    'error_count': self.error_count
+                    'processed_count': self._metrics['messages_processed'],
+                    'error_count': self._metrics['messages_failed']
                 }
             }
             
@@ -352,14 +638,58 @@ class ScalableKafkaConsumer:
         except Exception as e:
             logger.error(f"Consumer {self.consumer_id} stats update error: {e}")
     
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get consumer metrics for monitoring"""
+        uptime = time.time() - self._metrics['start_time']
+        return {
+            **self._metrics,
+            'uptime_seconds': uptime,
+            'messages_per_second': self._metrics['messages_processed'] / uptime if uptime > 0 else 0,
+            'error_rate': self._metrics['messages_failed'] / max(self._metrics['messages_processed'], 1),
+            'consumer_id': self.consumer_id,
+            'consumer_group': self.consumer_group,
+            'topic': self.topic
+        }
+    
     def _cleanup(self):
-        """Clean up consumer resources"""
-        logger.info(f"Consumer {self.consumer_id} cleaning up...")
-        if self.consumer:
-            self.consumer.close()
-        logger.info(f"Consumer {self.consumer_id} cleanup complete. Processed: {self.processed_count}, Errors: {self.error_count}")
+        """Enhanced cleanup with graceful shutdown"""
+        logger.info(
+            "Starting consumer cleanup",
+            extra={'consumer_id': self.consumer_id}
+        )
+        
+        try:
+            # Close DLQ producer first
+            if self.dlq_producer:
+                self.dlq_producer.flush(timeout=10)
+                self.dlq_producer = None
+            
+            # Close main consumer
+            if self.consumer:
+                self.consumer.close()
+                self.consumer = None
+            
+            logger.info(
+                "Consumer cleanup complete",
+                extra={
+                    'consumer_id': self.consumer_id,
+                    'metrics': self._metrics
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                "Error during consumer cleanup",
+                extra={
+                    'consumer_id': self.consumer_id,
+                    'error': str(e)
+                }
+            )
     
     def stop(self):
-        """Stop the consumer"""
-        logger.info(f"Stopping consumer {self.consumer_id}...")
+        """Graceful stop of the consumer"""
+        logger.info(
+            "Stopping consumer gracefully",
+            extra={'consumer_id': self.consumer_id}
+        )
         self.running = False
