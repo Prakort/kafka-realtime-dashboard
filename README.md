@@ -2,6 +2,12 @@
 
 A production-ready real-time user action tracking system built with **Kafka**, **Django**, **React**, and **TailwindCSS**. This dashboard provides live monitoring of user events with WebSocket updates and comprehensive analytics.
 
+## 📸 Dashboard Preview
+
+![Kafka Real-time Dashboard](Dashboard.png)
+
+*Live dashboard showing real-time event tracking, queue monitoring, and interactive controls*
+
 ## 🚀 Features
 
 - **Real-time Event Tracking**: Live user action monitoring with WebSocket updates
