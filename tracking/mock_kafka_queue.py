@@ -52,3 +52,14 @@ class MockKafkaQueue:
         """Get the current size of the queue"""
         instance = cls()
         return instance._queue.qsize()
+    
+    @classmethod
+    def clear(cls):
+        """Clear all events from the queue"""
+        instance = cls()
+        while not instance._queue.empty():
+            try:
+                instance._queue.get_nowait()
+            except queue.Empty:
+                break
+        logger.info("Mock Kafka queue cleared")
