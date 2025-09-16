@@ -91,8 +91,8 @@ services:
       sh -c "python manage.py migrate &&
              daphne -b 0.0.0.0 -p 8000 dashboard_backend.asgi:application"
 
-  # Kafka Consumer
-  kafka-consumer:
+  # Kafka Consumer 1
+  kafka-consumer-1:
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -113,7 +113,70 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
-    command: python manage.py consume_kafka
+    command: python manage.py consume_kafka_scalable --consumer-id consumer-1 --consumer-group dashboard_consumer_group
+
+  # Kafka Consumer 2
+  kafka-consumer-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      - DEBUG=True
+      - DB_HOST=postgres
+      - DB_NAME=kafka_dashboard
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: python manage.py consume_kafka_scalable --consumer-id consumer-2 --consumer-group dashboard_consumer_group
+
+  # Kafka Consumer 3
+  kafka-consumer-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      - DEBUG=True
+      - DB_HOST=postgres
+      - DB_NAME=kafka_dashboard
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: python manage.py consume_kafka_scalable --consumer-id consumer-3 --consumer-group dashboard_consumer_group
+
+  # Batch Producer (for load testing)
+  batch-producer:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      - DEBUG=True
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: python producer_batch.py --bootstrap-servers kafka:9092 --mode batch --batch-size 50
 
   # React Frontend
   frontend:

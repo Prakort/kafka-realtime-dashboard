@@ -12,9 +12,12 @@ A production-ready real-time user action tracking system built with **Kafka**, *
 
 - **Real-time Event Tracking**: Live user action monitoring with WebSocket updates
 - **Kafka Integration**: Robust message streaming with confluent-kafka (with mock fallback)
+- **Scalable Architecture**: Multiple producers and consumers with load balancing
+- **Consumer Groups**: Automatic partition assignment and fault tolerance
 - **Django Channels**: WebSocket support for real-time communication
 - **React Frontend**: Modern, responsive UI with TailwindCSS
 - **Interactive Event Generation**: Test buttons for different event types and delays
+- **Batch Event Processing**: High-volume event generation for load testing
 - **Queue Monitoring**: Real-time message processing status with timing data
 - **Event Analytics**: Real-time statistics and top clicked elements
 - **Docker Support**: Complete containerization for easy deployment
@@ -134,8 +137,9 @@ A production-ready real-time user action tracking system built with **Kafka**, *
 
 ## 🎯 Usage
 
-### Event Producer
+### Event Producers
 
+#### Interactive Producer
 The `producer.py` script generates realistic user events for testing:
 
 ```bash
@@ -153,6 +157,45 @@ python producer.py --mock
 
 # Custom Kafka settings
 python producer.py --bootstrap-servers localhost:9092 --topic user_events
+```
+
+#### Batch Producer (Scalable)
+The `producer_batch.py` script generates high-volume events for load testing:
+
+```bash
+# Batch mode (100 events)
+python producer_batch.py --mode batch --batch-size 100
+
+# Continuous mode (50 events/second for 60 seconds)
+python producer_batch.py --mode continuous --events-per-second 50 --duration 60
+
+# Custom settings
+python producer_batch.py --bootstrap-servers localhost:9092 --topic user_events
+```
+
+### Scalable Consumer Management
+
+```bash
+# Start single consumer
+python manage.py consume_kafka_scalable --consumer-id consumer-1
+
+# Start multiple consumers with load balancing
+python manage.py consume_kafka_scalable --consumer-id consumer-1 --consumer-group dashboard_consumer_group
+python manage.py consume_kafka_scalable --consumer-id consumer-2 --consumer-group dashboard_consumer_group
+python manage.py consume_kafka_scalable --consumer-id consumer-3 --consumer-group dashboard_consumer_group
+```
+
+### Kafka Topic Management
+
+```bash
+# Create topic with partitions
+python manage_kafka.py --action create --topic user_events --partitions 3
+
+# List topics
+python manage_kafka.py --action list
+
+# Delete topic
+python manage_kafka.py --action delete --topic user_events
 ```
 
 ### API Endpoints
